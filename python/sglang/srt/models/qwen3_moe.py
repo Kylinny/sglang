@@ -230,6 +230,21 @@ def compute_yarn_parameters(
     return factor, low, high, attention_factor
 
 
+# Quant formats that may store the MoE router (`mlp.gate`) quantized, so the
+# router is built with the quant config and the checkpoint's per-layer
+# `ignore` list decides for each layer (a layer in `ignore` still resolves
+# to an unquantized linear). Any other format keeps the gate in bf16.
+_GATE_QUANT_FORMATS = ("modelslim", "compressed_tensors")
+
+
+def _get_gate_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    if quant_config is not None and quant_config.get_name() in _GATE_QUANT_FORMATS:
+        return quant_config
+    return None
+
+
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -265,16 +280,18 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
         )
 
-        # Router gate: description-driven quant. Only the offline ModelSlim path
-        # (which carries a per-layer quant_model_description) may quantise the
-        # gate — if the checkpoint stored it as MXFP8 it is loaded
-        # and dequantised correctly instead of cast to bf16 without its block scale.
-        # The online Fp8/mxfp8 path keeps the gate in bf16 (unchanged, verified).
-        gate_quant_config = (
-            quant_config
-            if (quant_config is not None and quant_config.get_name() == "modelslim")
-            else None
-        )
+        # Router gate: only quant formats that may store the router quantized
+        # get the config — the checkpoint's per-layer `ignore` list then
+        # decides for each layer. ModelSlim carries a per-layer
+        # quant_model_description (if the checkpoint stored the gate as MXFP8
+        # it is loaded and dequantised correctly instead of cast to bf16
+        # without its block scale). Compressed-tensors checkpoints may store
+        # the router quantized too (e.g. a W4A16 checkpoint whose `ignore`
+        # lists only `lm_head`): building the gate unquantized leaves its
+        # packed weights with no parameter to load into, so the router is
+        # silently never written. The online Fp8/mxfp8 path keeps the gate in
+        # bf16 (unchanged, verified).
+        gate_quant_config = _get_gate_quant_config(quant_config)
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
